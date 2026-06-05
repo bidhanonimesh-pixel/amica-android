@@ -1,0 +1,305 @@
+name: Build Amica Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Checkout Amica source
+        uses: actions/checkout@v4
+        with:
+          repository: semperai/amica
+          path: amica-source
+          ref: master
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android Build Tools
+        run: |
+          sdkmanager "build-tools;34.0.0" "platforms;android-34" "platform-tools"
+
+      - name: Install dependencies
+        working-directory: amica-source
+        run: npm ci --legacy-peer-deps
+
+      - name: Create env file
+        working-directory: amica-source
+        run: |
+          cat > .env.local << 'EOF'
+          NEXT_PUBLIC_APP_NAME=Amica
+          NEXT_PUBLIC_CHATBOT_BACKEND=chatgpt
+          NEXT_PUBLIC_OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          NEXT_PUBLIC_OPENAI_MODEL=gpt-4o-mini
+          NEXT_PUBLIC_OPENAI_URL=https://api.openai.com/v1
+          NEXT_PUBLIC_OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
+          NEXT_PUBLIC_ELEVENLABS_API_KEY=${{ secrets.ELEVENLABS_API_KEY }}
+          NEXT_PUBLIC_ELEVENLABS_VOICE_ID=21m00Tcm4TlvDq8ikWAM
+          NEXT_PUBLIC_TTS_BACKEND=elevenlabs
+          NEXT_PUBLIC_STT_BACKEND=whisper_browser
+          NEXT_PUBLIC_VISION_BACKEND=none
+          NEXT_PUBLIC_ANIMATION_BACKEND=none
+          NEXT_PUBLIC_VRM_URL=/vrm/AvatarSample_B.vrm
+          NEXT_PUBLIC_BGM_ENABLED=false
+          NEXT_PUBLIC_BACKGROUND_IMG_URL=/bg/bg-c.jpg
+          NEXT_PUBLIC_NAME=Amica
+          NEXT_PUBLIC_SYSTEM_PROMPT=You are Amica, a helpful friendly AI assistant with a 3D avatar.
+          NEXT_PUBLIC_SUPABASE_URL=https://placeholder.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY=placeholder_key
+          EOF
+
+      - name: Fix next.config.js for static export
+        working-directory: amica-source
+        run: |
+          cat > next.config.js << 'EOF'
+          /** @type {import('next').NextConfig} */
+          const nextConfig = {
+            output: "export",
+            trailingSlash: true,
+            reactStrictMode: true,
+            images: { unoptimized: true },
+            webpack: (config) => {
+              config.resolve.fallback = { fs: false, net: false, tls: false };
+              return config;
+            },
+          };
+          module.exports = nextConfig;
+          EOF
+
+      - name: Remove server-only pages
+        working-directory: amica-source
+        run: |
+          rm -rf src/pages/import 2>/dev/null || true
+          rm -f src/pages/share.tsx 2>/dev/null || true
+          rm -rf src/pages/api/ 2>/dev/null || true
+          echo "Pages after cleanup:"
+          ls src/pages/
+
+      - name: Patch all server-side code with Python
+        working-directory: amica-source
+        run: |
+          python3 << 'PYEOF'
+          import os, re
+
+          # 1. Create stub API files that are imported by other files
+          os.makedirs('src/pages/api', exist_ok=True)
+
+          with open('src/pages/api/amicaHandler.ts', 'w') as f:
+              f.write("import type { NextApiRequest, NextApiResponse } from 'next';\n")
+              f.write("export const sseClients: any[] = [];\n")
+              f.write("export default function handler(req: NextApiRequest, res: NextApiResponse) {\n")
+              f.write("  res.status(200).json({ ok: true });\n")
+              f.write("}\n")
+
+          with open('src/pages/api/dataHandler.ts', 'w') as f:
+              f.write("import type { NextApiRequest, NextApiResponse } from 'next';\n")
+              f.write("export default function handler(req: NextApiRequest, res: NextApiResponse) {\n")
+              f.write("  res.status(200).json({ ok: true });\n")
+              f.write("}\n")
+
+          print("Created stub API files")
+
+          # 2. Replace entire apiHelper.ts - no fs, no server code
+          apihelper_path = 'src/features/externalAPI/utils/apiHelper.ts'
+          if os.path.exists(apihelper_path):
+              with open(apihelper_path, 'w') as f:
+                  f.write("// Static build - server code removed\n")
+                  f.write("export interface ApiResponse { sessionId?: string; }\n")
+                  f.write("export const readFile = (_path: string): any => null;\n")
+                  f.write("export const writeFile = (_path: string, _data: any): void => {};\n")
+                  f.write("export const sendToClients = (_data: any): void => {};\n")
+                  f.write("export const getSessionData = (): any => ({});\n")
+              print("Fixed apiHelper.ts")
+
+          # 3. Patch index.tsx - remove ALL fetch calls to /api/
+          index_path = 'src/pages/index.tsx'
+          if os.path.exists(index_path):
+              with open(index_path, 'r') as f:
+                  content = f.read()
+
+              original = content
+
+              # Remove getServerSideProps or getStaticProps that call APIs
+              content = re.sub(
+                  r'export\s+(?:async\s+)?function\s+getServerSideProps[^}]+\{[^}]+\}',
+                  '',
+                  content,
+                  flags=re.DOTALL
+              )
+
+              # Replace any fetch to /api/dataHandler with a no-op
+              content = re.sub(
+                  r'(?:const\s+\w+\s*=\s*)?(?:await\s+)?fetch\s*\(\s*[`\'"](?:[^`\'"]*\/api\/dataHandler[^`\'"]*)[`\'"]\s*[^)]*\)',
+                  'Promise.resolve({ ok: true, json: () => Promise.resolve({}) })',
+                  content
+              )
+
+              # Remove import of BASE_URL if used only for API
+              content = re.sub(
+                  r'const\s+\w+\s*=\s*process\.env\.NEXT_PUBLIC_BASE_URL[^\n]*\n',
+                  '',
+                  content
+              )
+
+              if content != original:
+                  with open(index_path, 'w') as f:
+                      f.write(content)
+                  print("Patched index.tsx")
+              else:
+                  print("index.tsx - no changes needed")
+
+          # 4. Fix any other files that use process.env.NEXT_PUBLIC_BASE_URL + /api/
+          for root, dirs, files in os.walk('src'):
+              # Skip node_modules
+              dirs[:] = [d for d in dirs if d != 'node_modules']
+              for fname in files:
+                  if not fname.endswith(('.ts', '.tsx')):
+                      continue
+                  fpath = os.path.join(root, fname)
+                  if 'api/amicaHandler' in fpath or 'api/dataHandler' in fpath:
+                      continue
+                  with open(fpath, 'r', errors='ignore') as f:
+                      content = f.read()
+                  if 'NEXT_PUBLIC_BASE_URL' in content and '/api/' in content:
+                      new_content = re.sub(
+                          r'\$\{[^}]*NEXT_PUBLIC_BASE_URL[^}]*\}\/api\/\w+',
+                          'http://localhost:3000/api/stub',
+                          content
+                      )
+                      new_content = re.sub(
+                          r'process\.env\.NEXT_PUBLIC_BASE_URL\s*\+\s*[\'"]\/api\/[^\'"]+[\'"]',
+                          '"http://localhost:3000/api/stub"',
+                          new_content
+                      )
+                      if new_content != content:
+                          with open(fpath, 'w') as f:
+                              f.write(new_content)
+                          print(f"Patched BASE_URL in {fpath}")
+
+          print("All patches done!")
+          PYEOF
+
+      - name: Build Next.js static export
+        working-directory: amica-source
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+
+      - name: Verify build output exists
+        working-directory: amica-source
+        run: |
+          ls out/
+          echo "Build successful!"
+
+      - name: Install Capacitor
+        working-directory: amica-source
+        run: npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest --legacy-peer-deps
+
+      - name: Create Capacitor config
+        working-directory: amica-source
+        run: |
+          cat > capacitor.config.json << 'EOF'
+          {
+            "appId": "com.amica.android",
+            "appName": "Amica AI",
+            "webDir": "out",
+            "bundledWebRuntime": false,
+            "android": {
+              "allowMixedContent": true,
+              "captureInput": true
+            },
+            "plugins": {
+              "SplashScreen": {
+                "launchShowDuration": 2000,
+                "backgroundColor": "#1a1a2e"
+              }
+            },
+            "server": {
+              "androidScheme": "https",
+              "cleartext": true
+            }
+          }
+          EOF
+
+      - name: Add Android platform
+        working-directory: amica-source
+        run: npx cap add android
+
+      - name: Copy and sync assets
+        working-directory: amica-source
+        run: |
+          npx cap copy android
+          npx cap sync android
+
+      - name: Patch Android build.gradle
+        working-directory: amica-source/android
+        run: |
+          sed -i 's/compileSdkVersion .*/compileSdkVersion 34/' app/build.gradle
+          sed -i 's/targetSdkVersion .*/targetSdkVersion 34/' app/build.gradle
+          sed -i 's/minSdkVersion .*/minSdkVersion 26/' app/build.gradle
+          sed -i 's/sourceCompatibility JavaVersion.VERSION_1_8/sourceCompatibility JavaVersion.VERSION_17/' app/build.gradle
+          sed -i 's/targetCompatibility JavaVersion.VERSION_1_8/targetCompatibility JavaVersion.VERSION_17/' app/build.gradle
+          cat app/build.gradle | grep -E "compileSdk|targetSdk|minSdk|Compat"
+
+      - name: Patch AndroidManifest permissions
+        working-directory: amica-source/android/app/src/main
+        run: |
+          python3 << 'PYEOF'
+          with open('AndroidManifest.xml', 'r') as f:
+              content = f.read()
+          perms = '\n    <uses-permission android:name="android.permission.INTERNET" />\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n'
+          if 'RECORD_AUDIO' not in content:
+              content = content.replace('<application', perms + '\n    <application', 1)
+          if 'usesCleartextTraffic' not in content:
+              content = content.replace('<application', '<application android:usesCleartextTraffic="true"', 1)
+          with open('AndroidManifest.xml', 'w') as f:
+              f.write(content)
+          print("AndroidManifest patched!")
+          PYEOF
+
+      - name: Build Debug APK
+        working-directory: amica-source/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Amica-AI-APK
+          path: amica-source/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: "Amica AI v${{ github.run_number }}"
+          body: |
+            ## Amica AI Android APK
+            APK ডাউনলোড করুন এবং install করুন।
+            Settings > Security > Unknown Sources ON > APK install করুন
+          files: amica-source/android/app/build/outputs/apk/debug/app-debug.apk
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
